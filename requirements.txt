@@ -1,4 +1,6 @@
-psutil
-streamlit
-sentence-transformers
-psutil
+pandas>=2.0.0
+numpy>=1.24.0
+streamlit>=1.24.0
+sentence-transformers>=2.2연
+psutil>=5.9.0
+openpyxl>=3.1.0
