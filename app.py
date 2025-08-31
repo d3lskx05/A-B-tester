@@ -18,7 +18,7 @@ from sentence_transformers import SentenceTransformer
 
 st.set_page_config(page_title="A/B-тестер эмбеддинговых моделей", layout="wide")
 
-DEFAULT_DATASET_PATH = "/mnt/data/data6.xlsx"  # твой загруженный файл
+DEFAULT_DATASET_PATH = "https://raw.githubusercontent.com/skatzrskx55q/data-assistant-vfiziki/main/data6.xlsx"  # твой загруженный файл
 DEFAULT_TOP_K = 5
 
 # Предустановленные модели для удобства (можно вводить любые HF id вручную)
