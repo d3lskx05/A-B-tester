@@ -1,1 +1,4 @@
 psutil
+streamlit>
+sentence-transformers
+psutil
