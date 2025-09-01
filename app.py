@@ -484,7 +484,38 @@ if query:
                     </div>""",
                     unsafe_allow_html=True
                 )
+             # Формируем DataFrame с результатами
+    rows = []
+    for model, results in [("A", res_a["results"]), ("B", res_b["results"])]:
+        for r in results:
+            rows.append({
+                "model": model,
+                "query": query,
+                "phrase": r["phrase_full"],
+                "score": r["score"],
+                "topics": ", ".join(r["topics"]) if r["topics"] else "",
+                "comment": r["comment"],
+            })
 
+    results_df = pd.DataFrame(rows)
+
+    # Кнопка скачать CSV
+    csv_buf = io.StringIO()
+    results_df.to_csv(csv_buf, index=False)
+    st.download_button(
+        label="📥 Скачать отчёт в CSV",
+        data=csv_buf.getvalue(),
+        file_name="ab_results.csv",
+        mime="text/csv",
+    )
+
+    # ====== Кнопка сброса ======
+    if st.button("♻️ Сбросить сессию"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.session_state.clear()
+        st.experimental_rerun()
+    
     if show_debug:
         st.sidebar.write("### 🧾 Отладка (по запросу)")
         st.sidebar.write(f"Модель A: `{model_a}` | add_prefix={add_prefix_a} | hybrid={hybrid_a}")
