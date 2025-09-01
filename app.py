@@ -515,7 +515,7 @@ if query:
         st.cache_data.clear()
         st.cache_resource.clear()
         st.session_state.clear()
-        st.experimental_rerun()
+        st.rerun()
     
     if show_debug:
         st.sidebar.write("### 🧾 Отладка (по запросу)")
