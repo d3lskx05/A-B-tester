@@ -4,13 +4,13 @@ import re
 import math
 import psutil
 import io
-import numpy as np
-import pandas as pd
 from io import BytesIO, StringIO
 from typing import List, Tuple, Dict, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import numpy as np
+import pandas as pd
 import streamlit as st
+import torch
 from sentence_transformers import SentenceTransformer
 
 # =========================================
@@ -19,20 +19,10 @@ from sentence_transformers import SentenceTransformer
 
 st.set_page_config(page_title="A/B-тестер эмбеддинговых моделей", layout="wide")
 
-DEFAULT_DATASET_PATH = "https://raw.githubusercontent.com/skatzrskx55q/data-assistant-vfiziki/main/data6.xlsx"  # твой загруженный файл
+DEFAULT_DATASET_PATH = "https://raw.githubusercontent.com/skatzrskx55q/data-assistant-vfiziki/main/data6.xlsx"
 DEFAULT_TOP_K = 5
 
-# Предустановленные модели для удобства (можно вводить любые HF id вручную)
-PRESET_MODELS = [
-    "intfloat/multilingual-e5-small",
-    "intfloat/multilingual-e5-base",
-    "BAAI/bge-m3",
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-    "sentence-transformers/all-MiniLM-L6-v2",
-]
-
-# Правила префиксов по семействам (по умолчанию; можно переопределять в UI)
-# role: "query" | "passage"
+# Правила префиксов по семействам
 FAMILY_PREFIX_RULES = [
     {
         "pattern": r"(^|/)intfloat/.*e5.*",
@@ -44,22 +34,17 @@ FAMILY_PREFIX_RULES = [
         "query_prefix": "query: ",
         "passage_prefix": "document: ",
     },
-    # Универсальные (MiniLM/mpnet/…): без префиксов
 ]
 
 # =========================================
 # =========== КЕШИ / ВСПОМОГАТЕЛЬНЫЕ ======
 # =========================================
 
-@st.cache_resource(show_spinner=False)
-def get_model_cached(model_name: str) -> SentenceTransformer:
-    return SentenceTransformer(model_name)
-
 def detect_family_prefixes(model_name: str) -> Tuple[Optional[str], Optional[str]]:
     for rule in FAMILY_PREFIX_RULES:
-        if re.search(rule["pattern"], model_name):
+        if re.search(rule["pattern"], model_name or ""):
             return rule["query_prefix"], rule["passage_prefix"]
-    return None, None  # по умолчанию префиксов нет
+    return None, None
 
 def maybe_prefix(texts: List[str], prefix: Optional[str], add_prefix: bool) -> List[str]:
     if add_prefix and prefix:
@@ -67,26 +52,19 @@ def maybe_prefix(texts: List[str], prefix: Optional[str], add_prefix: bool) -> L
     return texts
 
 def cosine_sim_matrix(vec: np.ndarray, mat: np.ndarray, mat_norms: np.ndarray) -> np.ndarray:
-    # vec: (d,), mat: (N, d)
     vnorm = np.linalg.norm(vec) or 1e-10
     return (mat @ vec) / (mat_norms * vnorm)
 
 def human_bytes(n_bytes: int) -> str:
     if n_bytes < 1024: return f"{n_bytes} B"
-    for unit in ["KB","MB","GB","TB"]:
+    for unit in ["KB","MB","GB","TB","PB"]:
         n_bytes /= 1024.0
         if n_bytes < 1024.0:
             return f"{n_bytes:.1f} {unit}"
-    return f"{n_bytes:.1f} PB"
+    return f"{n_bytes:.1f} EB"
 
 def get_process_mem():
-    proc = psutil.Process(os.getpid())
-    rss = proc.memory_info().rss
-    return rss
-
-# =========================================
-# ============ ЗАГРУЗКА ДАННЫХ ============
-# =========================================
+    return psutil.Process(os.getpid()).memory_info().rss
 
 @st.cache_data(show_spinner=False)
 def load_excel_any(path_or_bytes: bytes | str) -> pd.DataFrame:
@@ -94,29 +72,30 @@ def load_excel_any(path_or_bytes: bytes | str) -> pd.DataFrame:
         df = pd.read_excel(BytesIO(path_or_bytes))
     else:
         df = pd.read_excel(path_or_bytes)
-    # Ожидаемые колонки: phrase, topics*, comment (как в твоём проекте)
-    # Собираем topics-колонки:
-    topic_cols = [c for c in df.columns if str(c).lower().startswith("topics")]
-    if not topic_cols:
-        # Если нет topics-колонок — создадим пустые
-        df["topics"] = [[] for _ in range(len(df))]
-    else:
-        df["topics"] = df[topic_cols].astype(str).agg(
-            lambda x: [v for v in x if v and v != "nan"], axis=1
-        )
+
     if "phrase" not in df.columns:
         raise ValueError("В Excel не найдена колонка 'phrase'")
     if "comment" not in df.columns:
         df["comment"] = ""
 
-    # Нормализованные поля
+    # нормализация
     df["phrase_full"] = df["phrase"]
-    df["phrase_proc"] = df["phrase"].astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+    df["phrase_proc"] = (
+        df["phrase"].astype(str).str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+    )
+    # topics больше не используем — оставим пустые колонки для совместимости
+    if "topics" not in df.columns:
+        df["topics"] = [[] for _ in range(len(df))]
     return df[["phrase", "phrase_proc", "phrase_full", "topics", "comment"]]
 
 # =========================================
 # ====== ПОДГОТОВКА ЭМБЕДДИНГОВ БАЗЫ ======
 # =========================================
+
+@st.cache_resource(show_spinner=False)
+def load_model(model_name: str) -> SentenceTransformer:
+    # Загружаем модель на CPU (без автокастов), чтобы беречь память
+    return SentenceTransformer(model_name, device="cpu")
 
 @st.cache_data(show_spinner=False)
 def compute_phrase_embeddings(
@@ -127,24 +106,15 @@ def compute_phrase_embeddings(
     custom_passage_prefix: str | None,
     batch_size: int = 128,
 ) -> Dict[str, np.ndarray]:
-    """
-    Предвычисляет эмбеддинги для базы фраз под конкретную модель и флаги префиксов.
-    Возвращает dict: {"embeddings": (N, d), "norms": (N,), "dim": d}
-    """
-    model = get_model_cached(model_name)
-
-    # Автодетект префиксов + кастомные переопределения из UI
+    model = load_model(model_name)
     auto_q, auto_p = detect_family_prefixes(model_name)
-    q_prefix = (custom_query_prefix if (custom_query_prefix is not None) else auto_q)
     p_prefix = (custom_passage_prefix if (custom_passage_prefix is not None) else auto_p)
-
-    phrases = df["phrase_proc"].tolist()
-    passages = maybe_prefix(phrases, p_prefix, add_prefix)
+    passages = maybe_prefix(df["phrase_proc"].tolist(), p_prefix, add_prefix)
 
     embs: List[np.ndarray] = []
     for i in range(0, len(passages), batch_size):
         batch = passages[i:i+batch_size]
-        batch_embs = model.encode(batch, convert_to_numpy=True, show_progress_bar=False)
+        batch_embs = model.encode(batch, convert_to_numpy=True, show_progress_bar=False, batch_size=batch_size)
         embs.append(batch_embs.astype("float32"))
 
     if embs:
@@ -163,7 +133,7 @@ def compute_phrase_embeddings(
     }
 
 # =========================================
-# =============== ПОИСК ====================
+# ========= ПОИСК / СИМУЛЯЦИЯ =============
 # =========================================
 
 def search_topk(
@@ -177,23 +147,16 @@ def search_topk(
     top_k: int = DEFAULT_TOP_K,
     hybrid_query: bool = True,
 ) -> Dict:
-    """
-    Возвращает результаты поиска + метрики.
-    hybrid_query=True: как в твоём проекте — смешиваем query с префиксом и без.
-    """
-    model = get_model_cached(model_name)
-
-    auto_q, auto_p = detect_family_prefixes(model_name)
+    model = load_model(model_name)
+    auto_q, _ = detect_family_prefixes(model_name)
     q_prefix = (custom_query_prefix if (custom_query_prefix is not None) else auto_q)
 
     phrase_embs = precomputed["embeddings"]
     phrase_norms = precomputed["norms"]
-
     if phrase_embs is None or phrase_embs.size == 0:
         return {"results": [], "latency_s": 0.0}
 
     t0 = time.time()
-    # Запросы: с префиксом и без (если нужно)
     q_proc = str(query_text).lower().strip()
     q_pref = maybe_prefix([q_proc], q_prefix, add_prefix)[0] if q_prefix else q_proc
 
@@ -219,12 +182,7 @@ def search_topk(
         for i in idx
     ]
     latency = time.time() - t0
-
     return {"results": results, "latency_s": latency}
-
-# =========================================
-# ========= СИМУЛЯЦИЯ НАГРУЗКИ ============
-# =========================================
 
 def simulate_users(
     n_users: int,
@@ -238,10 +196,6 @@ def simulate_users(
     custom_passage_prefix: str | None,
     top_k: int,
 ) -> Dict:
-    """
-    Простейшая параллельная симуляция «виртуальных пользователей» потоками.
-    Измеряем latency на каждый запрос.
-    """
     latencies = []
     start_rss = get_process_mem()
     start_cpu = psutil.cpu_percent(interval=None)
@@ -260,10 +214,9 @@ def simulate_users(
         )
         return r["latency_s"]
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     with ThreadPoolExecutor(max_workers=n_users) as ex:
-        futures = []
-        for _ in range(n_users * n_requests_per_user):
-            futures.append(ex.submit(one_call))
+        futures = [ex.submit(one_call) for _ in range(n_users * n_requests_per_user)]
         for fut in as_completed(futures):
             latencies.append(fut.result())
 
@@ -284,6 +237,7 @@ def simulate_users(
         "cpu_end_pct": float(end_cpu),
         "mem_start": int(start_rss),
         "mem_end": int(end_rss),
+        "latencies_ms": latencies * 1000.0,
     }
 
 # =========================================
@@ -291,9 +245,9 @@ def simulate_users(
 # =========================================
 
 st.title("🔬 Универсальный A/B-тестер моделей эмбеддингов")
-st.caption("Сравнение качества, скорости и ресурсов для E5/BGE/MiniLM/mpnet и др.")
+st.caption("Экономичный режим для Streamlit Community — ручная загрузка моделей, A/B-переключатель и отчёты.")
 
-# ---- Сайдбар: Загрузка / Метрики окружения / Настройки логгирования
+# ------ Сайдбар: Датасет / Ресурсы / Служебные
 with st.sidebar:
     st.header("⚙️ Настройки")
 
@@ -303,21 +257,13 @@ with st.sidebar:
         df = load_excel_any(uploaded.read())
         st.success(f"Загружено строк: {len(df)}")
     else:
-        # Фоллбэк на заранее загруженный файл
         df = load_excel_any(DEFAULT_DATASET_PATH)
         st.info(f"Используем {DEFAULT_DATASET_PATH}. Строк: {len(df)}")
 
     st.subheader("🧪 Лёгкие метрики датасета")
-    n_phrases = len(df)
-    all_topics = sorted({t for row in df["topics"] for t in row}) if "topics" in df.columns else []
-    st.write(f"- Кол-во фраз: **{n_phrases}**")
-    st.write(f"- Уникальных тематик: **{len(all_topics)}**")
+    st.write(f"- Кол-во фраз: **{len(df)}**")
     st.write(f"- Средняя длина фразы: **{df['phrase'].astype(str).str.len().mean():.1f}**")
     st.write(f"- Максимальная длина фразы: **{df['phrase'].astype(str).str.len().max()}**")
-
-    st.subheader("🧰 Логгирование (вкл/выкл)")
-    show_debug = st.toggle("Показывать отладочную информацию", value=True,
-                           help="Это легко убрать на проде — выключите и удалите блоки sidebar.write().")
 
     st.subheader("💻 Мониторинг ресурсов")
     vm = psutil.virtual_memory()
@@ -327,257 +273,323 @@ with st.sidebar:
     st.write(f"RAM (process): **{human_bytes(rss)}**")
     st.write(f"RAM (system used): **{human_bytes(vm.used)} / {human_bytes(vm.total)} ({vm.percent:.1f}%)**")
 
-# ---- Главная: выбор моделей и префиксов
-st.markdown("### 🧠 Выбор моделей для A/B")
-colA, colB = st.columns(2)
+    st.subheader("🧹 Обслуживание")
+    if st.button("♻️ Полный сброс (кэш + сессия)"):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        st.session_state.clear()
+        st.rerun()
 
-with colA:
-    st.markdown("**Модель A**")
-    model_a = st.selectbox("Выбери/введи HF id модели A:", options=PRESET_MODELS, index=1, key="model_a", help="Можно дописать свой id вручную.")
-    model_a = st.text_input("Или укажи другой HF id для модели A:", value=model_a, key="model_a_text")
-with colB:
-    st.markdown("**Модель B**")
-    model_b = st.selectbox("Выбери/введи HF id модели B:", options=PRESET_MODELS, index=0, key="model_b", help="Можно дописать свой id вручную.")
-    model_b = st.text_input("Или укажи другой HF id для модели B:", value=model_b, key="model_b_text")
+# --------- Режим работы: A/B или одиночный
+ab_mode = st.toggle("🔀 A/B тест включён", value=True, help="Выключите, чтобы тестировать одну модель.")
+
+st.markdown("### 🧠 Модели")
+# Инициализация структуры с загруженными моделями и индексами
+if "models" not in st.session_state:
+    st.session_state.models = {}     # name -> {loaded:bool, add_prefix, hybrid, custom_q, custom_p, batch_size, precomputed}
+if "order" not in st.session_state:
+    st.session_state.order = []      # порядок добавления
+
+def model_controls(slot_name: str):
+    with st.container(border=True):
+        st.markdown(f"**{slot_name}**")
+        col = st.columns([3,1,1,1])
+        with col[0]:
+            m_name = st.text_input(f"{slot_name}: HF id модели", value="", placeholder="например, intfloat/multilingual-e5-small", key=f"{slot_name}_name")
+        with col[1]:
+            add_prefix = st.toggle("add_prefix", value=True, key=f"{slot_name}_addpref")
+        with col[2]:
+            hybrid = st.toggle("гибрид", value=True, key=f"{slot_name}_hybrid")
+        with col[3]:
+            batch_size = st.number_input("batch", min_value=8, max_value=512, step=8, value=128, key=f"{slot_name}_bs")
+
+        cq, cp = st.columns(2)
+        with cq:
+            custom_q = st.text_input("query_prefix (необязательно)", value="", key=f"{slot_name}_q")
+        with cp:
+            custom_p = st.text_input("passage_prefix (необязательно)", value="", key=f"{slot_name}_p")
+
+        lc = st.columns([1,1,2])
+        with lc[0]:
+            if st.button("📦 Загрузить", key=f"{slot_name}_load"):
+                name = (m_name or "").strip()
+                if name == "":
+                    st.warning("Укажите HF id модели.")
+                else:
+                    # реальная загрузка модели
+                    with st.spinner("Загрузка модели..."):
+                        _ = load_model(name)  # кэшируется как ресурс; создаёт экземпляр и скачивает при первом вызове
+                    # предвычисление индекса
+                    with st.spinner("Подготовка эмбеддингов базы..."):
+                        pre = compute_phrase_embeddings(
+                            df, name, add_prefix,
+                            (custom_q.strip() or None),
+                            (custom_p.strip() or None),
+                            batch_size=batch_size
+                        )
+                    st.session_state.models[name] = dict(
+                        add_prefix=add_prefix, hybrid=hybrid,
+                        custom_q=(custom_q.strip() or None),
+                        custom_p=(custom_p.strip() or None),
+                        batch_size=int(batch_size),
+                        precomputed=pre,
+                    )
+                    if name not in st.session_state.order:
+                        st.session_state.order.append(name)
+                    st.success(f"Модель '{name}' готова.")
+        with lc[1]:
+            if st.button("🗑️ Удалить", key=f"{slot_name}_del"):
+                name = st.session_state.get(f"{slot_name}_name","")
+                if name in st.session_state.models:
+                    del st.session_state.models[name]
+                    st.session_state.order = [x for x in st.session_state.order if x != name]
+                    st.info(f"Модель '{name}' удалена из сессии. (Для освобождения RAM кэшов нажмите «Полный сброс» в сайдбаре)")
+
+if ab_mode:
+    cA, cB = st.columns(2)
+    with cA: model_controls("Модель A")
+    with cB: model_controls("Модель B")
+else:
+    model_controls("Модель")
 
 st.markdown("---")
 
-# Префиксы и режимы
-st.markdown("### 🔖 Префиксы и режимы")
-c1, c2, c3, c4 = st.columns([1,1,1,1])
-with c1:
-    add_prefix_a = st.toggle("A: add_prefix", value=True, key="add_prefix_a")
-with c2:
-    add_prefix_b = st.toggle("B: add_prefix", value=True, key="add_prefix_b")
-with c3:
-    hybrid_a = st.toggle("A: гибридный запрос", value=True, key="hybrid_a", help="Смешивает query с префиксом и без — как в твоём проекте.")
-with c4:
-    hybrid_b = st.toggle("B: гибридный запрос", value=True, key="hybrid_b")
+# --------- Таблица параметров загруженных моделей
+def model_meta_table(names: List[str]) -> pd.DataFrame:
+    rows = []
+    for name in names:
+        try:
+            m = load_model(name)
+            # попытка извлечь сведения из Transformer
+            try:
+                mod0 = m[0].auto_model  # первый модуль — Transformer
+                cfg = getattr(mod0, "config", None)
+            except Exception:
+                mod0, cfg = None, None
 
-# Кастомные префиксы (опционально)
-with st.expander("🧩 Пользовательские префиксы (необязательно)"):
-    st.caption("Если оставить пустыми — подставятся автопрефиксы по семейству модели (E5/BGE).")
-    colp1, colp2 = st.columns(2)
-    with colp1:
-        custom_q_a = st.text_input("A: query_prefix", value="", placeholder="например, 'query: '")
-        custom_p_a = st.text_input("A: passage_prefix", value="", placeholder="например, 'passage: '")
-    with colp2:
-        custom_q_b = st.text_input("B: query_prefix", value="", placeholder="например, 'query: '", key="q_b")
-        custom_p_b = st.text_input("B: passage_prefix", value="", placeholder="например, 'document: '", key="p_b")
+            params = sum(p.numel() for p in m._first_module().auto_model.parameters()) if hasattr(m._first_module(), "auto_model") else \
+                     sum(p.numel() for p in m._first_module().parameters())
+            bytes_per_param = 4  # float32 оценка
+            size_mb = params * bytes_per_param / (1024**2)
 
-def none_if_empty(s: str) -> Optional[str]:
-    s = (s or "").strip()
-    return s if s != "" else None
+            dim = m.get_sentence_embedding_dimension()
+            max_len = m.get_max_seq_length() if hasattr(m, "get_max_seq_length") else getattr(cfg, "max_position_embeddings", None)
+            n_layers = getattr(cfg, "num_hidden_layers", None)
+            hidden = getattr(cfg, "hidden_size", None)
+            heads = getattr(cfg, "num_attention_heads", None)
+            dtype = str(next(m.parameters()).dtype).replace("torch.", "") if hasattr(m, "parameters") else "unknown"
+            device = str(next(iter(m._first_module().parameters())).device) if hasattr(m._first_module(), "parameters") else "cpu"
 
-custom_q_a = none_if_empty(custom_q_a)
-custom_p_a = none_if_empty(custom_p_a)
-custom_q_b = none_if_empty(custom_q_b)
-custom_p_b = none_if_empty(custom_p_b)
+            row = dict(
+                model=name,
+                emb_dim=dim,
+                max_seq_len=max_len,
+                device=device,
+                dtype=dtype,
+                params=int(params),
+                size_est_mb=round(size_mb, 1),
+                layers=n_layers,
+                hidden_size=hidden,
+                attn_heads=heads,
+                batch_opt=st.session_state.models[name]["batch_size"] if name in st.session_state.models else None,
+                add_prefix=st.session_state.models.get(name,{}).get("add_prefix"),
+                hybrid=st.session_state.models.get(name,{}).get("hybrid"),
+                query_prefix=st.session_state.models.get(name,{}).get("custom_q"),
+                passage_prefix=st.session_state.models.get(name,{}).get("custom_p"),
+            )
+            rows.append(row)
+        except Exception as e:
+            rows.append({"model": name, "error": str(e)})
+    return pd.DataFrame(rows)
 
-# Предвычисление эмбеддингов под каждую модель
-with st.spinner("Готовим эмбеддинги под модель A..."):
-    precomputed_a = compute_phrase_embeddings(df, model_a, add_prefix_a, custom_q_a, custom_p_a)
-with st.spinner("Готовим эмбеддинги под модель B..."):
-    precomputed_b = compute_phrase_embeddings(df, model_b, add_prefix_b, custom_q_b, custom_p_b)
-
-# Показ «лёгких» метрик по моделям
-mc1, mc2 = st.columns(2)
-with mc1:
-    st.markdown(f"**Модель A:** `{model_a}`")
-    st.write(f"- Размерность эмбеддингов: **{precomputed_a['dim']}**")
-    st.write(f"- Фраз в базе: **{len(df)}**")
-with mc2:
-    st.markdown(f"**Модель B:** `{model_b}`")
-    st.write(f"- Размерность эмбеддингов: **{precomputed_b['dim']}**")
-    st.write(f"- Фраз в базе: **{len(df)}**")
+loaded_names = st.session_state.order[:]
+if loaded_names:
+    st.markdown("### 📋 Параметры загруженных моделей")
+    meta_df = model_meta_table(loaded_names)
+    st.dataframe(meta_df, use_container_width=True)
+else:
+    st.info("Пока моделей не загружено. Введите HF id и нажмите «Загрузить».")
 
 st.markdown("---")
 
-# ====== Поисковый ввод + фильтры ======
-st.markdown("### 🔎 Поиск и A/B сравнение")
-query = st.text_input("Введите запрос (query):", "")
-
+# --------- Поиск (одна или две модели, только среди загруженных)
+st.markdown("### 🔎 Поиск")
+query = st.text_input("Введите запрос:", "")
 top_k = st.slider("Top-K результатов:", min_value=1, max_value=20, value=DEFAULT_TOP_K, step=1)
 
-# Фильтр по тематикам (опционально)
-all_topics_sorted = sorted({t for row in df["topics"] for t in row}) if "topics" in df.columns else []
-selected_topics = st.multiselect("Фильтр по тематикам:", all_topics_sorted, default=[])
-if selected_topics:
-    mask = df["topics"].apply(lambda ts: any(t in ts for t in selected_topics))
-    df_filtered = df[mask].reset_index(drop=True)
-
-    # Вырезаем соответствующие строки из эмбеддингов
-    idxs = np.where(mask.values)[0]
-    precomputed_a_f = {
-        "embeddings": precomputed_a["embeddings"][idxs] if len(idxs) else np.zeros((0, precomputed_a["dim"]), dtype="float32"),
-        "norms": precomputed_a["norms"][idxs] if len(idxs) else np.zeros((0,), dtype="float32"),
-        "dim": precomputed_a["dim"]
-    }
-    precomputed_b_f = {
-        "embeddings": precomputed_b["embeddings"][idxs] if len(idxs) else np.zeros((0, precomputed_b["dim"]), dtype="float32"),
-        "norms": precomputed_b["norms"][idxs] if len(idxs) else np.zeros((0,), dtype="float32"),
-        "dim": precomputed_b["dim"]
-    }
-else:
-    df_filtered = df
-    precomputed_a_f = precomputed_a
-    precomputed_b_f = precomputed_b
-
-# ====== A/B поиск ======
-if query:
-    # До/после ресурсы — лёгкое логгирование
+def run_search_block(model_name: str, title: str):
+    if model_name not in st.session_state.models:
+        st.warning(f"{title}: модель не загружена.")
+        return None
+    cfg = st.session_state.models[model_name]
     cpu_before = psutil.cpu_percent(interval=None)
     mem_before = get_process_mem()
 
-    res_a = search_topk(
+    res = search_topk(
         query_text=query,
-        df=df_filtered,
-        model_name=model_a,
-        precomputed=precomputed_a_f,
-        add_prefix=add_prefix_a,
-        custom_query_prefix=custom_q_a,
-        custom_passage_prefix=custom_p_a,
+        df=df,
+        model_name=model_name,
+        precomputed=cfg["precomputed"],
+        add_prefix=cfg["add_prefix"],
+        custom_query_prefix=cfg["custom_q"],
+        custom_passage_prefix=cfg["custom_p"],
         top_k=top_k,
-        hybrid_query=hybrid_a
-    )
-    res_b = search_topk(
-        query_text=query,
-        df=df_filtered,
-        model_name=model_b,
-        precomputed=precomputed_b_f,
-        add_prefix=add_prefix_b,
-        custom_query_prefix=custom_q_b,
-        custom_passage_prefix=custom_p_b,
-        top_k=top_k,
-        hybrid_query=hybrid_b
+        hybrid_query=cfg["hybrid"],
     )
 
     cpu_after = psutil.cpu_percent(interval=None)
     mem_after = get_process_mem()
 
-    ca, cb = st.columns(2)
-    with ca:
-        st.subheader("A — результаты")
-        st.write(f"⏱️ Время ответа: **{res_a['latency_s']*1000:.1f} ms**")
-        st.write(f"CPU Δ: **{max(0.0, cpu_after - cpu_before):.1f}%**, RAM Δ: **{human_bytes(max(0, mem_after - mem_before))}**")
-        for item in res_a["results"]:
-            with st.container():
-                st.markdown(
-                    f"""<div style="border:1px solid #e0e0e0;border-radius:12px;padding:12px;margin:8px 0;background:#fafafa">
-                        <div style="font-weight:600">🧠 {item['phrase_full']}</div>
-                        <div style="font-size:13px;color:#666">🎯 Score: {item['score']:.3f}</div>
-                        <div style="font-size:13px;color:#666">🔖 Тематики: {', '.join(item['topics']) if item['topics'] else '—'}</div>
-                    </div>""",
-                    unsafe_allow_html=True
-                )
+    st.subheader(title)
+    st.write(f"⏱️ Время ответа: **{res['latency_s']*1000:.1f} ms**")
+    st.write(f"CPU Δ: **{max(0.0, cpu_after - cpu_before):.1f}%**, RAM Δ: **{human_bytes(max(0, mem_after - mem_before))}**")
+    for item in res["results"]:
+        with st.container():
+            st.markdown(
+                f"""<div style="border:1px solid #e0e0e0;border-radius:12px;padding:12px;margin:8px 0;background:#fafafa">
+                    <div style="font-weight:600">🧠 {item['phrase_full']}</div>
+                    <div style="font-size:13px;color:#666">🎯 Score: {item['score']:.3f}</div>
+                </div>""",
+                unsafe_allow_html=True
+            )
+    return res
 
-    with cb:
-        st.subheader("B — результаты")
-        st.write(f"⏱️ Время ответа: **{res_b['latency_s']*1000:.1f} ms**")
-        st.write(f"CPU Δ: **{max(0.0, cpu_after - cpu_before):.1f}%**, RAM Δ: **{human_bytes(max(0, mem_after - mem_before))}**")
-        for item in res_b["results"]:
-            with st.container():
-                st.markdown(
-                    f"""<div style="border:1px solid #e0e0e0;border-radius:12px;padding:12px;margin:8px 0;background:#fafafa">
-                        <div style="font-weight:600">🧠 {item['phrase_full']}</div>
-                        <div style="font-size:13px;color:#666">🎯 Score: {item['score']:.3f}</div>
-                        <div style="font-size:13px;color:#666">🔖 Тематики: {', '.join(item['topics']) if item['topics'] else '—'}</div>
-                    </div>""",
-                    unsafe_allow_html=True
-                )
-             # Формируем DataFrame с результатами
-    rows = []
-    for model, results in [("A", res_a["results"]), ("B", res_b["results"])]:
-        for r in results:
-            rows.append({
-                "model": model,
-                "query": query,
-                "phrase": r["phrase_full"],
-                "score": r["score"],
-                "topics": ", ".join(r["topics"]) if r["topics"] else "",
-                "comment": r["comment"],
-            })
+if query:
+    if ab_mode:
+        c1, c2 = st.columns(2)
+        with c1:
+            # берём первую загруженную как A (если поле совпадает по имени — отлично)
+            nameA = st.session_state.get("Модель A_name","")
+            nameA = nameA if nameA in loaded_names else (loaded_names[0] if loaded_names else "")
+            res_a = run_search_block(nameA, "A — результаты") if nameA else None
+        with c2:
+            nameB = st.session_state.get("Модель B_name","")
+            nameB = nameB if (nameB in loaded_names and nameB != nameA) else (loaded_names[1] if len(loaded_names)>1 else "")
+            res_b = run_search_block(nameB, "B — результаты") if nameB else None
 
-    results_df = pd.DataFrame(rows)
-
-    # Кнопка скачать CSV
-    csv_buf = io.StringIO()
-    results_df.to_csv(csv_buf, index=False)
-    st.download_button(
-        label="📥 Скачать отчёт в CSV",
-        data=csv_buf.getvalue(),
-        file_name="ab_results.csv",
-        mime="text/csv",
-    )
-
-    # ====== Кнопка сброса ======
-    if st.button("♻️ Сбросить сессию"):
-        st.cache_data.clear()
-        st.cache_resource.clear()
-        st.session_state.clear()
-        st.rerun()
-    
-    if show_debug:
-        st.sidebar.write("### 🧾 Отладка (по запросу)")
-        st.sidebar.write(f"Модель A: `{model_a}` | add_prefix={add_prefix_a} | hybrid={hybrid_a}")
-        st.sidebar.write(f"Модель B: `{model_b}` | add_prefix={add_prefix_b} | hybrid={hybrid_b}")
-        st.sidebar.write(f"CPU (before→after): {cpu_before:.1f}% → {cpu_after:.1f}%")
-        st.sidebar.write(f"RAM (proc, before→after): {human_bytes(mem_before)} → {human_bytes(mem_after)}")
-
-st.markdown("---")
-
-# ====== Симуляция нагрузки ======
-st.markdown("### 🧪 Нагрузочный тест (простая симуляция параллельных пользователей)")
-col_s1, col_s2, col_s3, col_s4 = st.columns([1,1,1,2])
-with col_s1:
-    sim_model = st.selectbox("Модель для симуляции", options=[model_a, model_b], index=0)
-with col_s2:
-    sim_users = st.number_input("Кол-во пользователей", min_value=1, max_value=32, value=5, step=1)
-with col_s3:
-    sim_reqs = st.number_input("Запросов на пользователя", min_value=1, max_value=50, value=3, step=1)
-with col_s4:
-    sim_query = st.text_input("Тестовый запрос для симуляции", value=query or "как оплатить заказ")
-
-if st.button("🚀 Запустить симуляцию"):
-    if sim_model == model_a:
-        pre = precomputed_a_f
-        ap = add_prefix_a
-        cq = custom_q_a
-        cp = custom_p_a
+        # скачать результаты A/B (если обе есть)
+        if (res_a or res_b):
+            rows = []
+            if res_a:
+                for r in res_a["results"]:
+                    rows.append({"model":"A", "model_name": nameA, "query": query, "phrase": r["phrase_full"], "score": r["score"], "comment": r["comment"]})
+            if res_b:
+                for r in res_b["results"]:
+                    rows.append({"model":"B", "model_name": nameB, "query": query, "phrase": r["phrase_full"], "score": r["score"], "comment": r["comment"]})
+            results_df = pd.DataFrame(rows)
+            csv_buf = io.StringIO()
+            results_df.to_csv(csv_buf, index=False)
+            st.download_button(
+                label="📥 Скачать A/B результаты (CSV)",
+                data=csv_buf.getvalue(),
+                file_name="ab_results.csv",
+                mime="text/csv",
+            )
     else:
-        pre = precomputed_b_f
-        ap = add_prefix_b
-        cq = custom_q_b
-        cp = custom_p_b
-
-    with st.spinner("Выполняем параллельные запросы..."):
-        stats = simulate_users(
-            n_users=int(sim_users),
-            n_requests_per_user=int(sim_reqs),
-            query_text=sim_query,
-            df=df_filtered,
-            model_name=sim_model,
-            precomputed=pre,
-            add_prefix=ap,
-            custom_query_prefix=cq,
-            custom_passage_prefix=cp,
-            top_k=top_k,
-        )
-    st.success("Готово!")
-
-    colr1, colr2, colr3 = st.columns(3)
-    with colr1:
-        st.metric("Запросов всего", stats["count"])
-        st.metric("Среднее, ms", f"{stats['avg_ms']:.1f}")
-        st.metric("p95, ms", f"{stats['p95_ms']:.1f}")
-    with colr2:
-        st.metric("min, ms", f"{stats['min_ms']:.1f}")
-        st.metric("max, ms", f"{stats['max_ms']:.1f}")
-        st.metric("Время теста, s", f"{stats['total_time_s']:.2f}")
-    with colr3:
-        st.metric("CPU start → end", f"{stats['cpu_start_pct']:.1f}% → {stats['cpu_end_pct']:.1f}%")
-        st.metric("RAM start", human_bytes(stats["mem_start"]))
-        st.metric("RAM end", human_bytes(stats["mem_end"]))
+        # одиночный режим
+        name = st.session_state.get("Модель_name","")
+        name = name if name in loaded_names else (loaded_names[0] if loaded_names else "")
+        res_single = run_search_block(name, "Результаты") if name else None
+        if res_single:
+            rows = [{"model": name, "query": query, "phrase": r["phrase_full"], "score": r["score"], "comment": r["comment"]} for r in res_single["results"]]
+            results_df = pd.DataFrame(rows)
+            csv_buf = io.StringIO()
+            results_df.to_csv(csv_buf, index=False)
+            st.download_button(
+                label="📥 Скачать результаты (CSV)",
+                data=csv_buf.getvalue(),
+                file_name="results.csv",
+                mime="text/csv",
+            )
 
 st.markdown("---")
-st.caption("Подсказка: на проде можно убрать весь отладочный вывод (sidebar.write), оставив только нужные метрики.")
+
+# --------- Нагрузочный тест (только по загруженным моделям)
+st.markdown("### 🧪 Нагрузочный тест")
+if not loaded_names:
+    st.info("Сначала загрузите хотя бы одну модель.")
+else:
+    col_s1, col_s2, col_s3, col_s4 = st.columns([1,1,1,2])
+    with col_s1:
+        sim_model = st.selectbox("Модель для симуляции", options=loaded_names, index=0)
+    with col_s2:
+        sim_users = st.number_input("Кол-во пользователей", min_value=1, max_value=32, value=5, step=1)
+    with col_s3:
+        sim_reqs = st.number_input("Запросов на пользователя", min_value=1, max_value=50, value=3, step=1)
+    with col_s4:
+        sim_query = st.text_input("Тестовый запрос для симуляции", value="как оплатить заказ")
+
+    if st.button("🚀 Запустить симуляцию"):
+        cfg = st.session_state.models[sim_model]
+        with st.spinner("Выполняем параллельные запросы..."):
+            stats = simulate_users(
+                n_users=int(sim_users),
+                n_requests_per_user=int(sim_reqs),
+                query_text=sim_query,
+                df=df,
+                model_name=sim_model,
+                precomputed=cfg["precomputed"],
+                add_prefix=cfg["add_prefix"],
+                custom_query_prefix=cfg["custom_q"],
+                custom_passage_prefix=cfg["custom_p"],
+                top_k=top_k,
+            )
+        st.success("Готово!")
+
+        colr1, colr2, colr3 = st.columns(3)
+        with colr1:
+            st.metric("Запросов всего", stats["count"])
+            st.metric("Среднее, ms", f"{stats['avg_ms']:.1f}")
+            st.metric("p95, ms", f"{stats['p95_ms']:.1f}")
+        with colr2:
+            st.metric("min, ms", f"{stats['min_ms']:.1f}")
+            st.metric("max, ms", f"{stats['max_ms']:.1f}")
+            st.metric("Время теста, s", f"{stats['total_time_s']:.2f}")
+        with colr3:
+            st.metric("CPU start → end", f"{stats['cpu_start_pct']:.1f}% → {stats['cpu_end_pct']:.1f}%")
+            st.metric("RAM start", human_bytes(stats["mem_start"]))
+            st.metric("RAM end", human_bytes(stats["mem_end"]))
+
+        # -------- CSV-отчёт со всеми результатами
+        per_req = pd.DataFrame({
+            "request_id": np.arange(1, stats["count"]+1, dtype=int),
+            "model": sim_model,
+            "users": int(sim_users),
+            "reqs_per_user": int(sim_reqs),
+            "query": sim_query,
+            "top_k": int(top_k),
+            "latency_ms": stats["latencies_ms"],
+        })
+        summary = pd.DataFrame([{
+            "model": sim_model,
+            "users": int(sim_users),
+            "reqs_per_user": int(sim_reqs),
+            "query": sim_query,
+            "top_k": int(top_k),
+            "count": stats["count"],
+            "avg_ms": stats["avg_ms"],
+            "p95_ms": stats["p95_ms"],
+            "min_ms": stats["min_ms"],
+            "max_ms": stats["max_ms"],
+            "total_time_s": stats["total_time_s"],
+            "cpu_start_pct": stats["cpu_start_pct"],
+            "cpu_end_pct": stats["cpu_end_pct"],
+            "mem_start": stats["mem_start"],
+            "mem_end": stats["mem_end"],
+        }])
+
+        # Склеиваем в один CSV с маркером
+        per_req["kind"] = "per_request"
+        summary["kind"] = "summary"
+        report_df = pd.concat([per_req, summary], ignore_index=True)
+        buf = io.StringIO()
+        report_df.to_csv(buf, index=False)
+        st.download_button(
+            label="📥 Скачать отчёт нагрузочного теста (CSV)",
+            data=buf.getvalue(),
+            file_name="load_test_report.csv",
+            mime="text/csv",
+        )
+
+st.markdown("---")
+st.caption("Подсказки: • Модели загружаются вручную, что экономит RAM. • Для полного освобождения памяти после экспериментов используйте «Полный сброс» в сайдбаре.")
